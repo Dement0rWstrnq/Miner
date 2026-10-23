@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Bybit Bot Control Panel</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 40px; }
+        .container { max-width: 600px; margin: 0 auto; background: #313244; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        h2 { text-align: center; color: #f9e2af; margin-bottom: 25px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; color: #a6adc8; }
+        input, select { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #45475a; background: #11111b; color: #cdd6f4; box-sizing: border-box; }
+        .btn-group { display: flex; gap: 10px; margin-top: 20px; }
+        button { flex: 1; padding: 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 16px; }
+        .btn-start { background-color: #a6e3a1; color: #11111b; }
+        .btn-stop { background-color: #f38ba8; color: #11111b; }
+        .status-panel { margin-top: 25px; padding: 15px; background: #181825; border-radius: 6px; text-align: center; }
+        .status-text { font-size: 18px; font-weight: bold; color: #89b4fa; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>🤖 Панель управления Bybit Ботом</h2>
+    
+    <form id="botForm">
+        <div class="form-group">
+            <label>API Key:</label>
+            <input type="text" name="api_key" value="Bbm9gT3SRxpjpc185F" required>
+        </div>
+        
+        <div class="form-group">
+            <label>API Secret:</label>
+            <input type="password" name="api_secret" value="Xhych1MeES3Axbki7NI59WcHGOG7yzXedEs7" required>
+        </div>
+        
+        <div class="form-group">
+            <label>Выбор монеты:</label>
+            <select name="symbol">
+                <option value="BTCUSDT">BTC/USDT (Bitcoin)</option>
+                <option value="ETHUSDT">ETH/USDT (Ethereum)</option>
+                <option value="SOLUSDT">SOL/USDT (Solana)</option>
+                <option value="XRPUSDT">XRP/USDT (Ripple)</option>
+            </select>
+        </div>
+        
+        <div class="form-group">
+            <label>Стартовый капитал (USDT):</label>
+            <input type="number" name="total_balance" value="10000" required>
+        </div>
+        
+        <div class="btn-group">
+            <button type="button" class="btn-start" onclick="startBot()">ЗАПУСТИТЬ</button>
+            <button type="button" class="btn-stop" onclick="stopBot()">ОСТАНОВИТЬ</button>
+        </div>
+    </form>
+
+    <div class="status-panel">
+        <div>Статус системы:</div>
+        <div id="statusDisplay" class="status-text">{{ status }}</div>
+        <div style="margin-top: 10px;">Текущий баланс в обороте: <span id="balanceDisplay" style="color: #a6e3a1;">{{ balance }}</span> USDT</div>
+    </div>
+</div>
+
+<script>
+    function startBot() {
+        const formData = new FormData(document.getElementById('botForm'));
+        fetch('/start', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => alert(data.message));
+    }
+
+    function stopBot() {
+        fetch('/stop', { method: 'POST' })
+            .then(res => res.json())
+            .then(data => alert(data.message));
+    }
+
+    // Автоматическое обновление статуса и баланса на странице каждую секунду
+    setInterval(() => {
+        fetch('/status')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('statusDisplay').innerText = data.status;
+                document.getElementById('balanceDisplay').innerText = data.balance;
+            });
+    }, 1000);
+</script>
+
+</body>
+</html>
