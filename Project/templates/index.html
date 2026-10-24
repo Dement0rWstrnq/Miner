@@ -34,14 +34,17 @@
             <input type="password" name="api_secret" value="Xhych1MeES3Axbki7NI59WcHGOG7yzXedEs7" required>
         </div>
         
-        <div class="form-group">
-            <label>Выбор монеты:</label>
-            <select name="symbol">
-                <option value="BTCUSDT">BTC/USDT (Bitcoin)</option>
-                <option value="ETHUSDT">ETH/USDT (Ethereum)</option>
-                <option value="SOLUSDT">SOL/USDT (Solana)</option>
-                <option value="XRPUSDT">XRP/USDT (Ripple)</option>
-            </select>
+         <div class="form-group">
+            <label>Выбор монеты (введите название или выберите):</label>
+            <!-- Текстовое поле ввода, привязанное к списку подсказок -->
+            <input type="text" name="symbol" list="symbolsList" value="{{ symbol }}" placeholder="Начните вводить, например: ETH..." autocomplete="off" required>
+            
+            <!-- Динамический список всех пар Bybit, по которому браузер будет делать фильтрацию -->
+            <datalist id="symbolsList">
+                {% for sym in symbols %}
+                    <option value="{{ sym }}"></option>
+                {% endfor %}
+            </datalist>
         </div>
         
         <div class="form-group">
@@ -55,10 +58,13 @@
         </div>
     </form>
 
-    <div class="status-panel">
+     <div class="status-panel">
         <div>Статус системы:</div>
         <div id="statusDisplay" class="status-text">{{ status }}</div>
         <div style="margin-top: 10px;">Текущий баланс в обороте: <span id="balanceDisplay" style="color: #a6e3a1;">{{ balance }}</span> USDT</div>
+        
+        <!-- ДОБАВЬТЕ ЭТУ СТРОКУ СЮДА: -->
+        <div class="profit-panel">💰 Зафиксированная чистая прибыль: <span id="profitDisplay">0.0000</span> USDT</div>
     </div>
 </div>
 

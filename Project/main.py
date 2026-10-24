@@ -4,7 +4,6 @@ import math
 import logging
 from pybit.unified_trading import HTTP, WebSocket
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -16,38 +15,26 @@ class MartingaleGridBot:
         self.symbol = symbol.upper()
         self.testnet = testnet
         
-        # Инициализация REST сессии для Демо-аккаунта
         self.session = HTTP(
             testnet=self.testnet,
             api_key=api_key,
             api_secret=api_secret,
             recv_window=60000,
-            demo=True  # ОБЯЗАТЕЛЬНО для демо-торговли на основном Bybit!
+            demo=True  
         )
         
-        # Динамический баланс (будет обновляться с биржи)
         self.total_balance = 0.0
-        
-        # Параметры округлений биржи (загружаются динамически)
-        self.price_scale = 2       
-        self.qty_scale = 4         
-        self.min_qty = 0.0001      
-        self.min_notional = 1.0    
-        
-        # Состояние торгового цикла
         self.is_cycle_active = False
         self.active_sell_orders = []  
         self.next_buy_order_id = None 
         
-        # Переменные стратегии
         self.start_price = 0.0
         self.current_buy_budget = 0.0
+        self.total_profit = 0.0  
         
-        # Загружаем правила округлений торговой пары
         self._load_symbol_rules()
 
     def _load_symbol_rules(self):
-        """Получает правила округлений цен и объемов с биржи Bybit V5"""
         try:
             res = self.session.get_instruments_info(category="spot", symbol=self.symbol)
             list_info = res.get("result", {}).get("list", [])
@@ -68,7 +55,6 @@ class MartingaleGridBot:
             logger.error(f"Ошибка загрузки спецификации рынка: {e}. Применяются дефолтные параметры.")
 
     def get_wallet_balance_usdt(self):
-        """Запрашивает актуальный баланс Единого торгового аккаунта (UTA) на бирже"""
         try:
             res = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
             list_info = res.get("result", {}).get("list", [])
@@ -85,7 +71,6 @@ class MartingaleGridBot:
             return 0.0
 
     def recover_state_from_exchange(self):
-        """[ПОДСЕЙВ] Проверяет биржу на наличие открытых ордеров перед стартом"""
         logger.info("🔍 Запуск модуля 'Подсейв': сканируем открытые ордера на Bybit...")
         try:
             res = self.session.get_open_orders(category="spot", symbol=self.symbol)
@@ -108,6 +93,31 @@ class MartingaleGridBot:
                 self.active_sell_orders = sells
                 self.is_cycle_active = True
                 
+                # --- АВТОМАТИЧЕСКИЙ РАСЧЕТ ВСЕГО КАПИТАЛА ПРИ ПОДСЕЙВЕ ---
+                free_usdt = self.get_wallet_balance_usdt()
+                frozen_usdt = 0.0
+                
+                # Считаем, сколько USDT сейчас заморожено во всех ордерах на продажу
+                for order in open_orders:
+                    if order.get("side") == "Sell":
+                        # Объем монет * ориентировочная цена покупки (цена продажи / 1.011)
+                        qty = float(order.get("qty", 0))
+                        price_sell = float(order.get("price", 0))
+                        frozen_usdt += qty * (price_sell / 1.011)
+                
+                # Общий капитал = Свободные USDT + Замороженные USDT
+                self.total_balance = free_usdt + frozen_usdt
+                logger.info(f"📊 Авторасчет капитала: Свободно={free_usdt:.2f} USDT, Заморожено в монетах={frozen_usdt:.2f} USDT | Итого капитал={self.total_balance:.2f} USDT")
+                # --------------------------------------------------------
+
+                if not hasattr(self, 'order_purchase_prices'):
+                    self.order_purchase_prices = {}
+                
+                backup_price = self.get_market_price()
+                for o_id in sells:
+                    if o_id not in self.order_purchase_prices:
+                        self.order_purchase_prices[o_id] = backup_price / 1.011
+                
                 if buy_id:
                     logger.info(f"⚠️ Восстановлен страховочный ордер закупки ID: {buy_id}")
                     self.next_buy_order_id = buy_id
@@ -117,7 +127,9 @@ class MartingaleGridBot:
                 else:
                     logger.info("⚠️ Страховочный ордер на покупку не найден на бирже. Выставляем новый страховочный шаг...")
                     self.start_price = self.get_market_price()
-                    self.current_buy_budget = self.get_wallet_balance_usdt() * 0.05
+                    
+                    # Бюджет следующего шага страховки (5% от общего пересчитанного капитала)
+                    self.current_buy_budget = self.total_balance * 0.05
                     
                     next_buy_price = self.round_price(self.start_price * (1 - 0.009))
                     next_buy_qty = self.round_qty(self.current_buy_budget / next_buy_price, next_buy_price)
@@ -174,43 +186,100 @@ class MartingaleGridBot:
         res = self.session.get_tickers(category="spot", symbol=self.symbol)
         return float(res["result"]["list"][0]["lastPrice"])
 
-    def start_new_cycle(self):
-        """Запуск нового торгового цикла"""
+    def start_new_cycle(self, calculated_balance=10000.0):
+        """Запуск торгового цикла строго от переданного капитала"""
         logger.info("=== Запуск нового торгового цикла ===")
         self.cancel_all_orders()
         
         self.active_sell_orders = []
         self.next_buy_order_id = None
         
-        fresh_balance = self.get_wallet_balance_usdt()
-        if fresh_balance > 0.0:
-            self.total_balance = fresh_balance
-        else:
-            if self.total_balance == 0.0:
-                self.total_balance = 10000.0 
+        if not hasattr(self, 'order_purchase_prices'):
+            self.order_purchase_prices = {}
+            
+        # Жестко фиксируем баланс, переданный сервером управления
+        self.total_balance = float(calculated_balance)
+        logger.info(f"📈 Работаем в текущем цикле от капитала: {self.total_balance:.4f} USDT")
         
-        self.start_price = self.get_market_price()
+        approx_price = self.get_market_price()
         first_buy_budget = self.total_balance * 0.20
         market_buy_amount = round(first_buy_budget, self.price_scale)
         
-        logger.info(f"Текущая цена: {self.start_price}. Покупка 20% от баланса. Сумма: {market_buy_amount} USDT")
+        logger.info(f"Ориентировочная цена: {approx_price}. Покупка 20% от капитала на сумму: {market_buy_amount} USDT")
         
         market_order_id = self.place_order_safe(side="Buy", qty=market_buy_amount, order_type="Market")
         if not market_order_id:
             logger.error("Не удалось совершить стартовую покупку. Перезапуск через 10 сек...")
             time.sleep(10)
-            return self.start_new_cycle()
+            return self.start_new_cycle(calculated_balance)
             
-        first_buy_qty_raw = market_buy_amount / self.start_price
-        first_buy_qty = self.round_qty(first_buy_qty_raw, self.start_price)
+        time.sleep(1)
+        
+        # ВЫТАСКИВАЕМ СРЕДНЮЮ ЦЕНУ ФАКТИЧЕСКОГО ИСПОЛНЕНИЯ (Идея с avgPrice)
+        actual_qty = 0.0
+        try:
+            order_info = self.session.get_order_history(category="spot", symbol=self.symbol, orderId=market_order_id)
+            orders_list = order_info.get("result", {}).get("list", [])
+            if orders_list:
+                market_order_data = orders_list[0]
+                self.start_price = float(market_order_data.get("avgPrice", 0) or market_order_data.get("price", 0))
+                actual_qty = float(market_order_data.get("cumExecQty", 0) or market_order_data.get("qty", 0))
+                logger.info(f"🎯 Точная средняя цена исполнения Market Buy: {self.start_price} USDT. Куплено: {actual_qty} монет.")
+        except Exception as err:
+            logger.error(f"Не удалось получить точную цену исполнения: {err}. Используем ориентировочную.")
             
-        sell_part_qty = self.round_qty(first_buy_qty / 4, self.start_price)
+        # Резервный расчет, если биржа не вернула историю вовремя
+        if self.start_price == 0.0:
+            self.start_price = approx_price
+            first_buy_qty_raw = market_buy_amount / self.start_price
+            actual_qty = self.round_qty(first_buy_qty_raw, self.start_price)
+            
+         # Учитываем спотовую комиссию Bybit (0.1%), которая вычитается из купленных монет
+        net_qty = actual_qty * 0.999
+        logger.info(f"Чистый объем монет на кошельке после вычета комиссии Bybit: {net_qty}")
+        
+        # Округляем объем строго В МЕНЬШУЮ сторону (вниз), чтобы избежать дефицита монет на 4-м шаге
+        raw_part = net_qty / 4
+        # Отрезаем лишние знаки после запятой в зависимости от qty_scale (для BIRB это до целых)
+        factor = 10 ** self.qty_scale
+        sell_part_qty = math.floor(raw_part * factor) / factor
+        sell_part_qty = self.round_qty(sell_part_qty, self.start_price)
+        
+        logger.info(f"Ювелирный расчет объема на 1 ордер продажи: {sell_part_qty} монет")
+        
         for i in range(1, 5):
             sell_price = self.round_price(self.start_price * (1 + 0.011 * i))
+            
+            # Если это 4-й (последний) ордер, забираем ВЕСЬ реальный остаток монет на балансе,
+            # делая защитную скидку в 0.2% на скрытые комиссии блокировки стакана Bybit
+            if i == 4:
+                # Отрезаем хвост под qty_scale
+                factor = 10 ** self.qty_scale
+                sell_part_qty = math.floor((net_qty - (sell_part_qty * 3)) * 0.998 * factor) / factor
+                sell_part_qty = self.round_qty(sell_part_qty, sell_price)
+                logger.info(f"Ордер №4: Зачистка остатка кошелька под лимиты Bybit. Объем: {sell_part_qty} монет")
+
             s_id = self.place_order_safe(side="Sell", qty=sell_part_qty, price=sell_price)
+            
+            if not s_id:
+                logger.warning(f"⚠️ Биржа отклонила ордер Тейк-Профит №{i}. Пробуем скорректировать объем...")
+                adjusted_qty = self.round_qty(sell_part_qty - self.min_qty, sell_price)
+                s_id = self.place_order_safe(side="Sell", qty=adjusted_qty, price=sell_price)
+                
             if s_id:
                 self.active_sell_orders.append(s_id)
+                self.order_purchase_prices[s_id] = self.start_price
+            
+        if not s_id:
+                logger.warning(f"⚠️ Биржа отклонила ордер Тейк-Профит №{i}. Пробуем скорректировать объем...")
+                adjusted_qty = self.round_qty(sell_part_qty - self.min_qty, sell_price) # Уменьшаем на 1 шаг
+                s_id = self.place_order_safe(side="Sell", qty=adjusted_qty, price=sell_price)
+                
+        if s_id:
+                self.active_sell_orders.append(s_id)
+                self.order_purchase_prices[s_id] = self.start_price
 
+        # 3. Выставляем страховочный ордер строго от средней цены исполнения
         self.current_buy_budget = self.total_balance * 0.05
         next_buy_price = self.round_price(self.start_price * (1 - 0.009))
         next_buy_qty = self.round_qty(self.current_buy_budget / next_buy_price, next_buy_price)
@@ -218,10 +287,15 @@ class MartingaleGridBot:
         logger.info(f"Выставляем страховочный ордер (-0.9%) по цене {next_buy_price}")
         self.next_buy_order_id = self.place_order_safe(side="Buy", qty=next_buy_qty, price=next_buy_price)
         
+        if not self.next_buy_order_id:
+            logger.error("❌ Биржа отклонила страховочный ордер на покупку. Повторная попытка через 5 сек...")
+            time.sleep(5)
+            self.cancel_all_orders()
+            return self.start_new_cycle()
+            
         self.is_cycle_active = True
 
     def handle_ws_message(self, message):
-        """Обработчик событий, поступающих из WebSocket в реальном времени"""
         if not self.is_cycle_active:
             return
             
@@ -233,55 +307,66 @@ class MartingaleGridBot:
             order_id = order.get("orderId")
             side = order.get("side")
             status = order.get("orderStatus")
-            exec_price = float(order.get("avgPrice", 0) or order.get("price", 0))
-            exec_qty = float(order.get("qty", 0))
             
-            # --- ОБРАБОТКА ИСПОЛНЕННЫХ ОРДЕРОВ (Filled) ---
-            if status == "Filled":
-                logger.info(f"Событие WS: ордер {order_id} ({side}) полностью исполнен по цене {exec_price}")
-                
-                # Сработал страховочный ордер на покупку
+            exec_qty = float(order.get("execQty", 0) or 0)
+            exec_price = float(order.get("avgPrice", 0) or order.get("price", 0))
+            exec_fee = float(order.get("execFee", 0) or 0)
+            
+            if status in ["Filled", "PartiallyFilled"] and exec_qty > 0:
                 if side == "Buy" and order_id == self.next_buy_order_id:
-                    logger.info("Страховочный ордер исполнен! Расширяем сетку вниз...")
+                    logger.info(f"Событие WS: Страховочный ордер закупки {order_id} исполнился на {exec_qty} монет")
                     
                     tp_price = self.round_price(exec_price * (1 + 0.011))
                     tp_qty = self.round_qty(exec_qty, tp_price)
                     s_id = self.place_order_safe(side="Sell", qty=tp_qty, price=tp_price)
                     if s_id:
                         self.active_sell_orders.append(s_id)
+                        if not hasattr(self, 'order_purchase_prices'):
+                            self.order_purchase_prices = {}
+                        self.order_purchase_prices[s_id] = exec_price
                         
-                    self.current_buy_budget = self.current_buy_budget * 1.2
-                    next_buy_price = self.round_price(exec_price * (1 - 0.009))
-                    next_buy_qty = self.round_qty(self.current_buy_budget / next_buy_price, next_buy_price)
-                    
-                    logger.info(f"Выставляем следующий усредняющий ордер по цене {next_buy_price}")
-                    self.next_buy_order_id = self.place_order_safe(side="Buy", qty=next_buy_qty, price=next_buy_price)
+                    if status == "Filled":
+                        logger.info("Страховочный уровень полностью заполнен. Сдвигаем сетку ниже...")
+                        self.current_buy_budget = self.current_buy_budget * 1.2
+                        next_buy_price = self.round_price(exec_price * (1 - 0.009))
+                        next_buy_qty = self.round_qty(self.current_buy_budget / next_buy_price, next_buy_price)
+                        
+                        self.next_buy_order_id = self.place_order_safe(side="Buy", qty=next_buy_qty, price=next_buy_price)
                 
-                # Исполнился один из ордеров на продажу
                 elif side == "Sell" and order_id in self.active_sell_orders:
-                    self.active_sell_orders.remove(order_id)
-                    logger.info(f"Осталось active_sell_orders: {len(self.active_sell_orders)}")
-                    
-                    if len(self.active_sell_orders) == 0:
-                        logger.info("🎯 ВСЕ ОРДЕРА НА ПРОДАЖУ ИСПОЛНЕНЫ! Прибыль зафиксирована.")
-                        self.is_cycle_active = False
-                        logger.info("Инициируем автоматический перезапуск бота с обновлением капитала...")
-                        self.start_new_cycle()
+                    if status == "Filled":
+                        if order_id in self.active_sell_orders:
+                            self.active_sell_orders.remove(order_id)
+                        
+                        if not hasattr(self, 'order_purchase_prices'):
+                            self.order_purchase_prices = {}
+                            
+                        purchase_price = self.order_purchase_prices.get(order_id, exec_price / 1.011)
+                        
+                        gross_buy_usdt = purchase_price * exec_qty
+                        gross_sell_usdt = exec_price * exec_qty
+                        
+                        trade_profit = gross_sell_usdt - gross_buy_usdt - exec_fee
+                        
+                        if trade_profit > 0.0:
+                            self.total_profit += trade_profit
+                            logger.info(f"💰 Сделка закрыта! Чистый профит: +{trade_profit:.4f} USDT. Всего: {self.total_profit:.4f} USDT")
+                        
+                        logger.info(f"Осталось ордеров на продажу: {len(self.active_sell_orders)}")
+                        
+                        if len(self.active_sell_orders) == 0:
+                            logger.info("🎯 ВСЕ ОРДЕРА НА ПРОДАЖУ ИСПОЛНЕНЫ! Перезапуск цикла...")
+                            self.is_cycle_active = False
+                            self.start_new_cycle()
 
-            # --- ОБРАБОТКА РУЧНОЙ ОТМЕНЫ ОРДЕРОВ (Cancelled) ---
             elif status == "Cancelled":
-                logger.warning(f"⚠️ Событие WS: ордер {order_id} ({side}) был ОТМЕНЕН ВРУЧНУЮ на бирже!")
-                
-                # Если руками отменили ордер на продажу — просто удаляем его из памяти бота
+                logger.warning(f"⚠️ Событие WS: ордер {order_id} ({side}) был ОТМЕНЕН ВРУЧНУЮ!")
                 if side == "Sell" and order_id in self.active_sell_orders:
                     self.active_sell_orders.remove(order_id)
-                    logger.info(f"Ордер удален из отслеживания. Осталось активных продаж в памяти: {len(self.active_sell_orders)}")
-                
-                # Если руками отменили страховку — просто сбрасываем её ID, не пытаясь перевыставить ее в WebSocket
+                    if hasattr(self, 'order_purchase_prices') and order_id in self.order_purchase_prices:
+                        del self.order_purchase_prices[order_id]
                 elif side == "Buy" and order_id == self.next_buy_order_id:
-                    logger.info("Страховочный ордер закупки убран пользователем.")
                     self.next_buy_order_id = None
-
 def main():
     API_KEY = "Bbm9gT3SRxpjpc185F"
     API_SECRET = "Xhych1MeES3Axbki7NI59WcHGOG7yzXedEs7"
