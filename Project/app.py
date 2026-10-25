@@ -38,7 +38,6 @@ def run_bot_in_background(api_key, api_secret, symbol):
             testnet=False
         )
         
-        # Считаем актуальный капитал: Стартовый ввод + Накопленная прибыль
         active_capital = gui_user_capital + clean_profit
         
         has_saved_state = bot_instance.recover_state_from_exchange()
@@ -48,13 +47,11 @@ def run_bot_in_background(api_key, api_secret, symbol):
         bot_status = f"Работает 🟢 (Пара: {symbol})"
         
         while bot_status.startswith("Работает"):
-            # Расчет сложного процента при автоматическом рестарте
             if not bot_instance.is_cycle_active:
                 logger.info("🎯 Фиксация: тейк-профиты закрыты. Зачищаем стакан перед реинвестированием...")
                 bot_instance.cancel_all_orders()
                 time.sleep(1)
                 
-                # Пересчитываем капитал со свежей прибылью
                 active_capital = gui_user_capital + clean_profit
                 bot_instance.start_new_cycle(active_capital)
                 continue
@@ -64,15 +61,21 @@ def run_bot_in_background(api_key, api_secret, symbol):
                 open_orders = res.get("result", {}).get("list", [])
                 
                 current_exchange_sells = []
-                is_insurance_buy_still_open = False
+                insurance_buy_order = None
                 
                 for o in open_orders:
                     if o.get("side") == "Sell":
-                        current_exchange_sells.append(o.get("orderId"))
+                        current_exchange_sells.append({
+                            "id": o.get("orderId"),
+                            "price": float(o.get("price", 0))
+                        })
                     elif o.get("side") == "Buy" and o.get("orderId") == bot_instance.next_buy_order_id:
-                        is_insurance_buy_still_open = True
+                        insurance_buy_order = o
 
-                # Очистка стакана при ручном обнулении
+                if bot_instance and hasattr(bot_instance, 'total_profit'):
+                    clean_profit = bot_instance.total_profit
+
+                # СИТУАЦИЯ 1: Полная ручная зачистка стакана
                 if bot_instance.is_cycle_active and len(open_orders) == 0:
                     logger.warning("⚠️ Стакан пуст! Принудительный перезапуск...")
                     bot_instance.is_cycle_active = False
@@ -81,7 +84,7 @@ def run_bot_in_background(api_key, api_secret, symbol):
                     bot_instance.start_new_cycle(active_capital)
                     continue
 
-                # Зависание страховки
+                # СИТУАЦИЯ 2: Все ордера на продажу исполнены, но страховочный ордер застрял
                 if bot_instance.is_cycle_active and len(current_exchange_sells) == 0 and len(open_orders) > 0:
                     logger.warning("⚠️ Тейк-профиты исполнены, но страховочный ордер застрял. Перезапуск...")
                     bot_instance.is_cycle_active = False
@@ -90,8 +93,8 @@ def run_bot_in_background(api_key, api_secret, symbol):
                     bot_instance.start_new_cycle(active_capital)
                     continue
 
-                # Пропуск WebSocket пакета
-                if bot_instance.is_cycle_active and bot_instance.next_buy_order_id and not is_insurance_buy_still_open:
+                # СИТУАЦИЯ 3: Страховочный ордер исполнен, но WebSocket пропустил пакет
+                if bot_instance.is_cycle_active and bot_instance.next_buy_order_id and not insurance_buy_order:
                     if len(current_exchange_sells) > 0:
                         logger.warning(f"🔄 Резервный аудит: Страховочный ордер {bot_instance.next_buy_order_id} исполнен (пропуск WS). Переставляем сетку...")
                         mock_exec_price = bot_instance.get_market_price()
@@ -108,6 +111,31 @@ def run_bot_in_background(api_key, api_secret, symbol):
                             }]
                         }
                         bot_instance.handle_ws_message(fake_msg)
+                        continue
+
+                # --- ЖЕСТКИЙ ТРЕЙЛИНГ СТРАХОВКИ С ФИКСИРОВАННЫМ ДИАПАЗОНОМ 0.9% ---
+                if bot_instance.is_cycle_active and insurance_buy_order and len(current_exchange_sells) > 0:
+                    current_buy_price = float(insurance_buy_order.get("price", 0))
+                    lowest_sell_price = min([s["price"] for s in current_exchange_sells])
+                    
+                    target_buy_price = lowest_sell_price * (1 - 0.015)
+                    target_buy_price = bot_instance.round_price(target_buy_price)
+                    
+                    if abs(target_buy_price - current_buy_price) > (current_buy_price * 0.0005):
+                        logger.warning(f"🔄 Смещение сетки! Корректируем расстояние: переносим Buy-ордер с {current_buy_price} на {target_buy_price} USDT (строго -1.5% от нижнего TP {lowest_sell_price})")
+                        try:
+                            bot_instance.session.cancel_order(
+                                category="spot",
+                                symbol=bot_instance.symbol,
+                                orderId=bot_instance.next_buy_order_id
+                            )
+                        except Exception:
+                            pass
+                            
+                        next_buy_qty = bot_instance.round_qty(bot_instance.current_buy_budget / target_buy_price, target_buy_price)
+                        new_buy_id = bot_instance.place_order_safe(side="Buy", qty=next_buy_qty, price=target_buy_price)
+                        if new_buy_id:
+                            bot_instance.next_buy_order_id = new_buy_id
 
             except Exception as audit_error:
                 logger.error(f"Ошибка фонового аудита: {audit_error}")

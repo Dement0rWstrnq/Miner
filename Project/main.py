@@ -156,7 +156,44 @@ class MartingaleGridBot:
         return round(qty, self.qty_scale)
 
     def place_order_safe(self, side, qty, price=None, order_type="Limit"):
+        """Безопасное выставление ордеров с автоматическим сплитованием при превышении лимитов Bybit"""
         try:
+            qty = float(qty)
+            # Задаем жесткий лимит биржи для BIRB (338,400). Для других монет ставим бесконечность.
+            max_limit = 335000.0 if self.symbol == "BIRBUSDT" else 999999999.0
+            
+            # Если ордер лимитный и его объем превышает максимальный лимит одного ордера
+            if order_type == "Limit" and qty > max_limit:
+                logger.warning(f"⚠️ Объем {side}-ордера ({qty}) превышает лимит стакана ({max_limit}). Разбиваем на части...")
+                
+                remaining_qty = qty
+                last_order_id = None
+                
+                while remaining_qty > 0:
+                    chunk_qty = min(remaining_qty, max_limit)
+                    chunk_qty = self.round_qty(chunk_qty, float(price) if price else self.get_market_price())
+                    
+                    if chunk_qty >= self.min_qty:
+                        params = {
+                            "category": "spot",
+                            "symbol": self.symbol,
+                            "side": side,
+                            "orderType": order_type,
+                            "qty": str(chunk_qty),
+                        }
+                        if price:
+                            params["price"] = str(price)
+                            
+                        res = self.session.place_order(**params)
+                        last_order_id = res.get("result", {}).get("orderId")
+                        logger.info(f"Выставлена часть составного ордера {side}. ID: {last_order_id} ({chunk_qty} монет)")
+                        time.sleep(0.2)
+                        
+                    remaining_qty -= chunk_qty
+                    
+                return last_order_id  # Возвращаем последний ID для трекинга сетки
+                
+            # Стандартное выставление, если объем проходит по лимитам
             params = {
                 "category": "spot",
                 "symbol": self.symbol,
@@ -171,6 +208,7 @@ class MartingaleGridBot:
             order_id = res.get("result", {}).get("orderId")
             logger.info(f"Успешно выставлен {side} {order_type} ордер. ID: {order_id}")
             return order_id
+            
         except Exception as e:
             logger.error(f"Критическая ошибка при выставлении ордера {side}: {e}")
             return None
